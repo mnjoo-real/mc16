@@ -77,6 +77,26 @@ synchronously with the field — i.e. genuine induction/hysteresis-motor physics
 not a hand-inserted drag term. `τ_lag` lumps eddy currents and hysteresis into
 one measurable parameter.
 
+Two ball field-sampling models are available:
+
+* `ball_model="point"` is the original and still-default model. The entire
+  sphere is represented by one relaxing dipole sampled at its centre.
+* `ball_model="volume"` is a first-order finite-size model. Deterministic
+  spherical quadrature samples the applied field and gradient throughout the
+  ball, evolves one local magnetisation-density state per volume element, and
+sums both dipole torque `dm × B` and distributed-force torque `r × dF`.
+Because the ball and quadrature domain are isotropic, the integration points are
+kept lab-aligned (`R_body=I`) rather than adding an otherwise unobservable body
+orientation state. Local vector magnetisation still contains the existing
+`ω_ball × M` rotation term.
+
+The volume model accounts for nonuniform **applied** field across the sphere,
+but it is not a complete Maxwell or ferromagnetic-sphere solution. It neglects
+internal demagnetising-field coupling between elements, eddy-current/skin-depth
+shielding, true hysteresis/remanence, and interaction with a conductive plate.
+The default quadrature is `volume_quadrature="medium"` (192 elements); `coarse`
+(48) and `fine` (768) are available for convergence checks.
+
 ### Contact
 
 Regularised Coulomb friction (`tanh(|u|/u_reg)`) at the contact point plus

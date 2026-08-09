@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from dataclasses import dataclass, asdict, field as dc_field
+from dataclasses import dataclass, asdict, field as dc_field, replace
 
 import numpy as np
 
@@ -98,6 +98,10 @@ class Params:
     chi_eff: float = 3.0       # 3*(mu_r-1)/(mu_r+2) -> 3 for mu_r>>1
     Ms: float = 1.7e6          # saturation magnetisation             [A/m]
     tau_lag: float = 4.0e-3    # magnetisation relaxation time        [s]
+
+    # --- ball field-sampling model -----------------------------------------
+    ball_model: str = "point"  # "point" (original) or "volume" (distributed)
+    volume_quadrature: str = "medium"  # "coarse" (48), "medium" (192), "fine" (768)
 
     # --- contact -----------------------------------------------------------
     mu_k: float = 0.15         # sliding friction coefficient
@@ -303,6 +307,106 @@ class FieldGrid:
 
 
 # ============================================================================
+# Deterministic finite-volume quadrature and stacked field slices
+# ============================================================================
+VOLUME_QUADRATURE_LEVELS = {
+    "coarse": (2, 3, 8),       # 48 elements
+    "medium": (3, 4, 16),     # 192 elements
+    "fine": (4, 6, 32),       # 768 elements
+}
+
+
+def sphere_quadrature(radius: float, level: str = "medium"):
+    """Gauss-Legendre r/mu and uniform-azimuth quadrature for a sphere.
+
+    Returns lab-aligned offsets and physical volume weights.  In the present
+    first-order isotropic/no-interaction closure, rotating the spherical
+    quadrature would only rotate/relabel integration points, so no body
+    orientation state is introduced.  The local magnetisation vectors still
+    obey the existing omega x M rotation/relaxation law.
+    """
+    if level not in VOLUME_QUADRATURE_LEVELS:
+        raise ValueError(f"unknown volume quadrature {level!r}; expected one of "
+                         f"{tuple(VOLUME_QUADRATURE_LEVELS)}")
+    nr, nmu, nphi = VOLUME_QUADRATURE_LEVELS[level]
+    xr, wr = np.polynomial.legendre.leggauss(nr)
+    mu, wmu = np.polynomial.legendre.leggauss(nmu)
+    s = 0.5 * (xr + 1.0)
+    wr_s = 0.5 * wr
+    phis = 2.0 * np.pi * np.arange(nphi) / nphi
+
+    points = np.empty((nr * nmu * nphi, 3))
+    weights = np.empty(nr * nmu * nphi)
+    k = 0
+    for ir in range(nr):
+        rr = radius * s[ir]
+        radial_weight = radius ** 3 * wr_s[ir] * s[ir] ** 2
+        for im in range(nmu):
+            sint = np.sqrt(max(0.0, 1.0 - mu[im] ** 2))
+            ring_weight = radial_weight * wmu[im] * (2.0 * np.pi / nphi)
+            for ph in phis:
+                points[k] = (rr * sint * np.cos(ph), rr * sint * np.sin(ph),
+                             rr * mu[im])
+                weights[k] = ring_weight
+                k += 1
+    return points, weights
+
+
+class VolumeFieldGrid:
+    """Existing 2-D FieldGrid implementation stacked at quadrature z offsets.
+
+    Each element samples B and the same five stored gradient channels from the
+    slice at its fixed lab-frame z offset.  This is a first-order distributed
+    applied-field model; it contains no element-element magnetic interaction.
+    """
+
+    def __init__(self, p: Params, cache_dir: str | None = "volume_fieldcache",
+                 verbose: bool = True):
+        if p.ball_model != "volume":
+            raise ValueError("VolumeFieldGrid requires Params(ball_model='volume')")
+        self.p = p
+        self.points, self.weights = sphere_quadrature(p.ball_R, p.volume_quadrature)
+        zvals, self.z_index = np.unique(self.points[:, 2], return_inverse=True)
+        self.z_offsets = zvals
+
+        qsig = hashlib.md5(np.column_stack((self.points, self.weights)).tobytes()).hexdigest()[:12]
+        fn = None
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+            fn = os.path.join(cache_dir,
+                              f"volume_field_{p.field_key()}_{p.volume_quadrature}_{qsig}.npz")
+        if fn and os.path.exists(fn):
+            d = np.load(fn)
+            self.xs, self.ys, self.F = d["xs"], d["ys"], d["F"]
+        else:
+            slices = []
+            for iz, zoff in enumerate(zvals):
+                if verbose:
+                    print(f"  [volume field] slice {iz+1}/{len(zvals)} "
+                          f"(z offset={zoff*1e3:+.3f} mm) ...", flush=True)
+                # FieldGrid height is gap+ball_R; shifting gap shifts the entire
+                # sampling plane while preserving the original analytic model.
+                ps = replace(p, gap=p.gap + float(zoff), ball_model="point")
+                gs = FieldGrid(ps, cache_dir=None, verbose=False)
+                if not slices:
+                    self.xs, self.ys = gs.xs, gs.ys
+                slices.append(gs.F)
+            self.F = np.stack(slices, axis=0)
+            if fn:
+                np.savez_compressed(fn, xs=self.xs, ys=self.ys, F=self.F)
+        self.x0, self.y0 = self.xs[0], self.ys[0]
+        self.dx = self.xs[1] - self.xs[0]
+        self.dy = self.ys[1] - self.ys[0]
+
+    @property
+    def n_elem(self):
+        return len(self.weights)
+
+    def volume_error(self):
+        return abs(np.sum(self.weights) - self.p.volume) / self.p.volume
+
+
+# ============================================================================
 # Fast kernels
 # ============================================================================
 @njit(cache=True, fastmath=True)
@@ -359,6 +463,102 @@ def _field_lab(F, x0, y0, dx, dy, x, y, ang):
     B = R @ Bp
     J = R @ Jp @ R.T
     return B, J
+
+
+@njit(cache=True, fastmath=True)
+def _volume_magnetic(state, Fstack, z_index, points, weights, x0, y0, dx, dy,
+                     ang, Ms, tau_lag, derivatives, compute_derivatives):
+    """Sum distributed force/torque and optionally fill dM/dt.
+
+    Element magnetisation states are densities M [A/m]; weights are dV [m^3],
+    so dm=M*dV has units A m^2.  Points are lab-aligned offsets from the ball
+    centre and are also the moment arms for distributed-force torque.
+    """
+    px, py = state[0], state[1]
+    wx, wy, wz = state[4], state[5], state[6]
+    force = np.zeros(3)
+    torque = np.zeros(3)
+    bnorm_sum = 0.0
+    c, s = np.cos(ang), np.sin(ang)
+    for i in range(len(weights)):
+        # Scalar form of the exact same lab<->disc transformation used by
+        # _field_lab, avoiding per-element matrix allocations in this hot loop.
+        x = px + points[i, 0]
+        y = py + points[i, 1]
+        xr, yr = c*x+s*y, -s*x+c*y
+        q = _bilinear(Fstack[z_index[i]], x0, y0, dx, dy, xr, yr)
+        bx, by, bz = c*q[0]-s*q[1], s*q[0]+c*q[1], q[2]
+        mx, my, mz = state[7+3*i], state[8+3*i], state[9+3*i]
+        dv = weights[i]
+        dmx, dmy, dmz = mx*dv, my*dv, mz*dv
+        # Rotate dipole moment to disc frame, apply Jp, rotate force back.
+        mdx, mdy = c*dmx+s*dmy, -s*dmx+c*dmy
+        fdx = q[3]*mdx + q[5]*mdy + q[6]*dmz
+        fdy = q[5]*mdx + q[4]*mdy + q[7]*dmz
+        dfz = q[6]*mdx + q[7]*mdy - (q[3]+q[4])*dmz
+        dfx, dfy = c*fdx-s*fdy, s*fdx+c*fdy
+        force[0] += dfx
+        force[1] += dfy
+        force[2] += dfz
+        # local dipole torque dm x B
+        torque[0] += dmy*bz - dmz*by
+        torque[1] += dmz*bx - dmx*bz
+        torque[2] += dmx*by - dmy*bx
+        # distributed-force torque r_i x dF_i
+        rx, ry, rz = points[i, 0], points[i, 1], points[i, 2]
+        torque[0] += ry*dfz - rz*dfy
+        torque[1] += rz*dfx - rx*dfz
+        torque[2] += rx*dfy - ry*dfx
+        bn = np.sqrt(bx*bx+by*by+bz*bz) + 1e-18
+        bnorm_sum += bn*dv
+        if compute_derivatives:
+            meq = 3.0*bn/MU0
+            if meq > Ms:
+                meq = Ms
+            mex, mey, mez = meq*bx/bn, meq*by/bn, meq*bz/bn
+            derivatives[7+3*i] = (wy*mz - wz*my) + (mex-mx)/tau_lag
+            derivatives[8+3*i] = (wz*mx - wx*mz) + (mey-my)/tau_lag
+            derivatives[9+3*i] = (wx*my - wy*mx) + (mez-mz)/tau_lag
+    return force, torque, bnorm_sum / np.sum(weights)
+
+
+@njit(cache=True, fastmath=True)
+def _deriv_volume(t, y, Fstack, z_index, points, weights, x0, y0, dx, dy,
+                  omega, Ms, tau_lag, mass, inertia, ball_R, mu_k, mu_roll,
+                  mu_spin, u_reg, gravity, r_rim, k_rim, c_rim):
+    out = np.zeros(len(y))
+    force, torque, _ = _volume_magnetic(y, Fstack, z_index, points, weights,
+                                        x0, y0, dx, dy, omega*t, Ms, tau_lag,
+                                        out, True)
+    Fx, Fy, Fz = force[0], force[1], force[2]
+    Tmx, Tmy, Tmz = torque[0], torque[1], torque[2]
+    px, py, vx, vy = y[0], y[1], y[2], y[3]
+    wx, wy, wz = y[4], y[5], y[6]
+    Nf = mass*gravity - Fz
+    if Nf < 0.0:
+        Nf = 0.0
+    ux, uy = vx-ball_R*wy, vy+ball_R*wx
+    un = np.sqrt(ux*ux+uy*uy)+1e-18
+    fmag = mu_k*Nf*np.tanh(un/u_reg)
+    fx, fy = -fmag*ux/un, -fmag*uy/un
+    Tfx, Tfy = ball_R*fy, -ball_R*fx
+    wh = np.sqrt(wx*wx+wy*wy)+1e-18
+    tr = mu_roll*Nf*ball_R*np.tanh(wh*ball_R/u_reg)
+    Trx, Try = -tr*wx/wh, -tr*wy/wh
+    Trz = -mu_spin*Nf*ball_R*np.tanh(wz*ball_R/u_reg)
+    Wx, Wy = 0.0, 0.0
+    if r_rim > 0.0:
+        rr = np.sqrt(px*px+py*py)+1e-18
+        if rr > r_rim:
+            ex, ey = px/rr, py/rr
+            fw = -k_rim*(rr-r_rim)-c_rim*(vx*ex+vy*ey)
+            Wx, Wy = fw*ex, fw*ey
+    out[0], out[1] = vx, vy
+    out[2], out[3] = (Fx+fx+Wx)/mass, (Fy+fy+Wy)/mass
+    out[4] = (Tmx+Tfx+Trx)/inertia
+    out[5] = (Tmy+Tfy+Try)/inertia
+    out[6] = (Tmz+Trz)/inertia
+    return out
 
 
 @njit(cache=True, fastmath=True)
@@ -492,18 +692,74 @@ def _integrate(y0, t_end, dt, stride, F, x0, y0g, dx, dy, omega, alpha, m_sat,
     return T[:io], Y[:io], D[:io]
 
 
+@njit(cache=True, fastmath=True)
+def _integrate_volume(y0, t_end, dt, stride, Fstack, z_index, points, weights,
+                      x0, y0g, dx, dy, omega, Ms, tau_lag, mass, inertia,
+                      ball_R, mu_k, mu_roll, mu_spin, u_reg, gravity, r_rim,
+                      k_rim, c_rim):
+    nstep = int(t_end/dt)
+    nout = nstep//stride+1
+    T = np.empty(nout)
+    Y = np.empty((nout, len(y0)))
+    D = np.empty((nout, 8))
+    y = y0.copy()
+    dummy = np.empty(0)
+    t, io = 0.0, 0
+    for step in range(nstep+1):
+        if step % stride == 0 and io < nout:
+            T[io] = t
+            for c in range(len(y)):
+                Y[io, c] = y[c]
+            force, torque, bmean = _volume_magnetic(
+                y, Fstack, z_index, points, weights, x0, y0g, dx, dy,
+                omega*t, Ms, tau_lag, dummy, False)
+            D[io, 0:3] = force
+            D[io, 3:6] = torque
+            D[io, 6] = bmean
+            nf = mass*gravity-force[2]
+            D[io, 7] = nf if nf > 0.0 else 0.0
+            io += 1
+        if step == nstep:
+            break
+        k1 = _deriv_volume(t, y, Fstack, z_index, points, weights, x0, y0g,
+                           dx, dy, omega, Ms, tau_lag, mass, inertia, ball_R,
+                           mu_k, mu_roll, mu_spin, u_reg, gravity, r_rim,
+                           k_rim, c_rim)
+        k2 = _deriv_volume(t+0.5*dt, y+0.5*dt*k1, Fstack, z_index, points,
+                           weights, x0, y0g, dx, dy, omega, Ms, tau_lag, mass,
+                           inertia, ball_R, mu_k, mu_roll, mu_spin, u_reg,
+                           gravity, r_rim, k_rim, c_rim)
+        k3 = _deriv_volume(t+0.5*dt, y+0.5*dt*k2, Fstack, z_index, points,
+                           weights, x0, y0g, dx, dy, omega, Ms, tau_lag, mass,
+                           inertia, ball_R, mu_k, mu_roll, mu_spin, u_reg,
+                           gravity, r_rim, k_rim, c_rim)
+        k4 = _deriv_volume(t+dt, y+dt*k3, Fstack, z_index, points, weights,
+                           x0, y0g, dx, dy, omega, Ms, tau_lag, mass, inertia,
+                           ball_R, mu_k, mu_roll, mu_spin, u_reg, gravity,
+                           r_rim, k_rim, c_rim)
+        y = y + dt/6.0*(k1+2*k2+2*k3+k4)
+        t = (step+1)*dt
+    return T[:io], Y[:io], D[:io]
+
+
 # ============================================================================
 # High level driver
 # ============================================================================
 class Result:
-    def __init__(self, p, T, Y, D):
+    def __init__(self, p, T, Y, D, volume_weights=None):
         self.p = p
         self.t = T
         self.state = Y            # raw 10-dim state history
         self.x, self.y = Y[:, 0], Y[:, 1]
         self.vx, self.vy = Y[:, 2], Y[:, 3]
         self.w = Y[:, 4:7]
-        self.m = Y[:, 7:10]
+        if volume_weights is None:
+            self.m = Y[:, 7:10]
+            self.M_elements = None
+        else:
+            self.M_elements = Y[:, 7:].reshape(len(Y), len(volume_weights), 3)
+            self.m = np.sum(self.M_elements * np.asarray(volume_weights)[None, :, None],
+                            axis=1)
         self.Fmag = D[:, 0:3]
         self.Tmag = D[:, 3:6]
         self.Bnorm = D[:, 6]
@@ -546,24 +802,43 @@ class Result:
                     slip=float(np.mean(self.slip[len(self.t) // 2:])))
 
 
-def simulate(p: Params, t_end=1.2, dt=2.0e-5, stride=25, grid: FieldGrid | None = None,
+def simulate(p: Params, t_end=1.2, dt=2.0e-5, stride=25,
+             grid: FieldGrid | VolumeFieldGrid | None = None,
              r0=None, phi0=0.0, v0=(0.0, 0.0), y_init=None, verbose=False) -> Result:
     """`y_init` (10-vector) overrides r0/phi0/v0 and lets a run continue
     seamlessly from the final state of a previous one -- needed for ramp
     experiments, otherwise every step restarts with zero spin and zero
     magnetisation and the transient swamps the result."""
-    g = grid if grid is not None else FieldGrid(p, verbose=verbose)
+    if p.ball_model not in ("point", "volume"):
+        raise ValueError("ball_model must be 'point' or 'volume'")
+    if grid is None:
+        g = (FieldGrid(p, verbose=verbose) if p.ball_model == "point"
+             else VolumeFieldGrid(p, verbose=verbose))
+    else:
+        g = grid
+    if p.ball_model == "volume" and not isinstance(g, VolumeFieldGrid):
+        raise TypeError("ball_model='volume' requires a VolumeFieldGrid")
+    if p.ball_model == "point" and not isinstance(g, FieldGrid):
+        raise TypeError("ball_model='point' requires a FieldGrid")
     if y_init is not None:
         y0 = np.asarray(y_init, dtype=float).copy()
     else:
         if r0 is None:
             r0 = p.r_mag
-        y0 = np.zeros(10)
+        nstate = 10 if p.ball_model == "point" else 7 + 3*g.n_elem
+        y0 = np.zeros(nstate)
         y0[0] = r0 * np.cos(phi0)
         y0[1] = r0 * np.sin(phi0)
         y0[2], y0[3] = v0
-    T, Y, D = _integrate(y0, t_end, dt, stride, g.F, g.x0, g.y0, g.dx, g.dy,
-                         p.omega, p.alpha, p.m_sat, p.tau_lag, p.mass,
-                         p.inertia, p.ball_R, p.mu_k, p.mu_roll, p.mu_spin,
-                         p.u_reg, G_ACC, p.r_rim, p.k_rim, p.c_rim)
-    return Result(p, T, Y, D)
+    if p.ball_model == "point":
+        T, Y, D = _integrate(y0, t_end, dt, stride, g.F, g.x0, g.y0, g.dx, g.dy,
+                             p.omega, p.alpha, p.m_sat, p.tau_lag, p.mass,
+                             p.inertia, p.ball_R, p.mu_k, p.mu_roll, p.mu_spin,
+                             p.u_reg, G_ACC, p.r_rim, p.k_rim, p.c_rim)
+        return Result(p, T, Y, D)
+    T, Y, D = _integrate_volume(
+        y0, t_end, dt, stride, g.F, g.z_index, g.points, g.weights,
+        g.x0, g.y0, g.dx, g.dy, p.omega, p.Ms, p.tau_lag, p.mass,
+        p.inertia, p.ball_R, p.mu_k, p.mu_roll, p.mu_spin, p.u_reg,
+        G_ACC, p.r_rim, p.k_rim, p.c_rim)
+    return Result(p, T, Y, D, volume_weights=g.weights)
