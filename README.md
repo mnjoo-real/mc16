@@ -173,6 +173,37 @@ range. A scalar Jiles--Atherton curve can be useful as a one-dimensional
 material-characterization kernel, but it is not a sufficient final law for the
 Carousel's rotating vector field.
 
+### Step 6B-1 — standalone isotropic vector hysteresis kernel
+
+`magnetic_hysteresis.py` implements the direct isotropic vector
+Jiles--Atherton increment formulation of Bergqvist (1996), with the later
+five-parameter notation used by Guérin et al. The exact frozen equations,
+loading criterion, units, and references are recorded in
+`docs/vector_ja_formulation.md`. The input is a prescribed constitutive field
+`H [A/m]`; the output and irreversible/reversible states are vector
+magnetizations `[A/m]`. The Langevin anhysteretic law and its tensor derivative
+use analytic zero-field series.
+
+The independent scalar reference has nonzero remanence, coercivity, and finite
+quasistatic loop area. Under collinear excitation the vector implementation
+reduces to it to floating-point accuracy. Circular, elliptical, nonplanar, and
+rotated 3-D paths test vector behavior, nonnegative closed-cycle work, and
+isotropic rotational covariance. Unlike `tau_lag`, its result depends on the
+field path rather than traversal frequency.
+
+The `synthetic_soft`, `synthetic_medium`, and `synthetic_hard` cases are
+deliberately uncalibrated sensitivity sets. They share isotropic scalar
+parameters in every direction and span `Ms=1.2--1.5 MA/m`, `a=4--9 kA/m`,
+`k=25--1600 A/m`, `c=0.10--0.35`, and `alpha=3--5e-5`. They are not “steel
+parameters” and no claim is made that they reproduce the ball. Passing vector
+tests also does not establish quantitative rotational-loss accuracy for real
+steel; measured alternating, minor, and rotational loops remain necessary.
+
+This kernel is still offline. It has not replaced `tau_lag`, entered the
+production RK4, or been combined with the self-consistent dynamic equation
+`H_int=H_ext+H_demag[M]`. That nonlinear history-dependent coupling is reserved
+for Step 6B-2 or later.
+
 ### Contact
 
 Regularised Coulomb friction (`tanh(|u|/u_reg)`) at the contact point plus
