@@ -184,6 +184,84 @@ def integrate_vector_path(H, p: JilesAthertonParams, initial_state=None):
                 M=states[:, :3]+states[:, 3:], final_state=state)
 
 
+def advance_vector_state(H0, H1, state, p: JilesAthertonParams):
+    """Advance one physical JA increment without mutating ``state``.
+
+    This small public wrapper is used by nonlinear field solvers.  Repeated
+    trial calls always start from the same committed state, so constitutive
+    history is not accumulated by nonlinear iterations.
+    """
+    state = np.asarray(state, dtype=float).copy()
+    out = _advance_segment(np.asarray(H0, dtype=float), state,
+                           np.asarray(H1, dtype=float)-np.asarray(H0, dtype=float),
+                           _vector_derivative, p)
+    if not np.all(np.isfinite(out)):
+        raise FloatingPointError("nonfinite vector JA state")
+    return out
+
+
+def _anhysteretic_vector_batch(He, p):
+    He = np.asarray(He, dtype=float)
+    r = np.linalg.norm(He, axis=1)
+    x = r/p.a
+    L = langevin(x)
+    radial = p.Ms/p.a*langevin_prime(x)
+    tangent = np.full_like(r, p.Ms/(3*p.a))
+    nz = r > 0
+    tangent[nz] = p.Ms*L[nz]/r[nz]
+    u = np.zeros_like(He); u[nz] = He[nz]/r[nz, None]
+    Man = p.Ms*L[:, None]*u
+    outer = np.einsum("ni,nj->nij", u, u)
+    J = tangent[:, None, None]*np.eye(3)+(radial-tangent)[:, None, None]*outer
+    return Man, J
+
+
+def _vector_derivative_batch(H, state, dH, p):
+    Mirr, Mrev = state[:, :3], state[:, 3:]
+    M = Mirr+Mrev
+    Man, xi = _anhysteretic_vector_batch(H+p.alpha*M, p)
+    chif = (Man-M)/p.k
+    cf = np.linalg.norm(chif, axis=1)
+    u = np.zeros_like(chif); nz = cf > 0; u[nz] = chif[nz]/cf[nz, None]
+    Girr = np.einsum("ni,nj->nij", u, chif)
+    I = np.broadcast_to(np.eye(3), xi.shape)
+    G = Girr+p.c*xi
+    A = np.linalg.solve(I-p.alpha*G, G)
+    dM = np.einsum("nij,nj->ni", A, dH)
+    dHe = dH+p.alpha*dM
+    active = nz & (np.einsum("ni,ni->n", chif, dHe) > 0)
+    if np.any(~active):
+        Gr = p.c*xi[~active]
+        Ar = np.linalg.solve(I[~active]-p.alpha*Gr, Gr)
+        dM[~active] = np.einsum("nij,nj->ni", Ar, dH[~active])
+        dHe[~active] = dH[~active]+p.alpha*dM[~active]
+    drive = np.einsum("ni,ni->n", chif, dHe)
+    dMirr = np.zeros_like(M); dMirr[active] = u[active]*drive[active, None]
+    dMrev = p.c*np.einsum("nij,nj->ni", xi, dHe)
+    return np.column_stack((dMirr, dMrev))
+
+
+def advance_vector_states(H0, H1, states, p: JilesAthertonParams,
+                          max_increment_factor=2.0):
+    """Vectorized commit-free JA advance for many independent material cells."""
+    H0, H1 = np.asarray(H0, dtype=float), np.asarray(H1, dtype=float)
+    state = np.asarray(states, dtype=float).copy()
+    dH = H1-H0
+    nsub = max(1, int(np.ceil(np.max(np.linalg.norm(dH, axis=1))
+                                  /(max_increment_factor*p.k))))
+    dh = dH/nsub; H = H0.copy()
+    for _ in range(nsub):
+        k1 = _vector_derivative_batch(H, state, dh, p)
+        k2 = _vector_derivative_batch(H+.5*dh, state+.5*k1, dh, p)
+        k3 = _vector_derivative_batch(H+.5*dh, state+.5*k2, dh, p)
+        k4 = _vector_derivative_batch(H+dh, state+k3, dh, p)
+        state += (k1+2*k2+2*k3+k4)/6
+        H += dh
+    if not np.all(np.isfinite(state)):
+        raise FloatingPointError("nonfinite batched vector JA state")
+    return state
+
+
 def alternating_path(H0, points_per_cycle=1000, cycles=4):
     """Demagnetized start, ramp to +H0, then complete closed cycles."""
     ramp = np.linspace(0, H0, points_per_cycle//4+1)

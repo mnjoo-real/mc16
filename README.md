@@ -204,6 +204,61 @@ production RK4, or been combined with the self-consistent dynamic equation
 `H_int=H_ext+H_demag[M]`. That nonlinear history-dependent coupling is reserved
 for Step 6B-2 or later.
 
+### Step 6B-2 — offline hysteretic sphere and demagnetization gate
+
+`magnetic_hysteretic_sphere.py` adds a body-fixed Cartesian material mesh,
+finite-cuboid arbitrary-`M` demagnetization operator, and commit-once nonlinear
+vector-JA coupling. The exact assumptions and the audit of the older linear
+surface-charge BEM are in `docs/hysteretic_demag_formulation.md`. The old BEM
+is valid for a homogeneous linear sphere but cannot represent the volume charge
+`-div(M)` of a general spatially varying hysteretic state.
+
+The cuboid operator uses finite rectangular-face sources and an exact cube self
+term. A symmetric macro/micro projection assigns `-I/3` to the uniform sphere
+mode, retains resolved zero-mean interactions, and bounds unresolved voxel
+modes to the physical demagnetizing spectrum. The 32/179/389-cell meshes have
+represented-volume errors of 4.51%, 0.331%, and 1.91%; their conservative
+half-voxel-diagonal surface scales are 43.3%, 24.7%, and 19.2% of the radius.
+The nonuniform energy probe differs by 1.44% between medium and fine.
+
+Independent linear checks pass. Uniform magnetization gives `Hdemag=-M/3` to
+roundoff, and `mu_r=10, 50, 100, 500` reproduce
+`3(mu_r-1)/(mu_r+2) Hext`. In the actual 8 mm FieldGrid, the medium-mesh linear
+force is `Fz=-0.2195 N`, its Maxwell-stress check is `-0.2146 N`, and the
+independent Step-4B surface BEM gives `-0.2026 N`. Across 3/5/8/16 mm, the new
+volume-force error relative to Step 4B is 8.85%/10.68%/8.35%/4.01%.
+
+For each physical increment the previous JA state is frozen, every nonlinear
+trial starts from that same state, and the state is committed only once after
+convergence. An under-relaxed predictor and Broyden iteration are used, with an
+independent least-squares fallback and optional physical-path bisection for
+controlled offline work. Residuals are normalized by the larger of `a` and
+the RMS applied field. Tolerances from `1e-4` through `1e-8` agree in the
+controlled increment test.
+
+Self-consistent demagnetization strongly changes the synthetic-medium uniform
+loop: at a 15 mT-equivalent applied amplitude, the bare material loop has
+`Mr=23.98 kA/m`, `Hc=321.15 A/m`, and `W=1122.44 J/m3/cycle`; the whole-sphere
+external loop has `Mr=0.724 kA/m`, `Hc=252.60 A/m`, and
+`W=34.02 J/m3/cycle`. Controlled uniform rotating fields converge for all
+three synthetic parameter sets with nonnegative work.
+
+The real nonuniform Carousel-history gate does **not** yet pass. Under the
+documented diagnostic compute cap, Broyden fails at early increments for the
+3--8 mm medium cases and both 8 mm sensitivity cases; the 16 mm case advances
+farther but also misses tolerance. A least-squares solve proves that at least
+the first failed 8 mm increment has a residual root, but completing a history
+by numerical-Jacobian fallback and adaptive bisection takes minutes even on the
+32-cell mesh. Force, torque, and synthetic-parameter claims for the hysteretic
+Carousel histories are therefore deliberately left unreported rather than
+inferred from unconverged states.
+
+This cost and robustness failure rules out direct use inside the `20 us` RK4.
+Step 6C should use a reduced macro/micro or spherical-mode basis, pre-factorized
+demagnetization, and a multirate constitutive update or calibrated surrogate.
+Production `tau_lag` remains unchanged; skin effect and the conducting plate
+are not reimplemented here. All JA parameter sets remain synthetic.
+
 ### Contact
 
 Regularised Coulomb friction (`tanh(|u|/u_reg)`) at the contact point plus
