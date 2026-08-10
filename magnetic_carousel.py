@@ -51,9 +51,17 @@ from __future__ import annotations
 
 import hashlib
 import os
+import zipfile
 from dataclasses import dataclass, asdict, field as dc_field, replace
 
 import numpy as np
+
+try:
+    from scipy.linalg import lu_factor, lu_solve
+    from scipy.special import sph_harm_y
+    HAVE_SCIPY = True
+except Exception:  # point and independent-volume models remain NumPy-only
+    HAVE_SCIPY = False
 
 MU0 = 4.0e-7 * np.pi
 G_ACC = 9.81
@@ -96,12 +104,14 @@ class Params:
 
     # --- ball magnetics ----------------------------------------------------
     chi_eff: float = 3.0       # 3*(mu_r-1)/(mu_r+2) -> 3 for mu_r>>1
+    mu_r: float = 100.0        # intrinsic relative permeability (linear reference)
     Ms: float = 1.7e6          # saturation magnetisation             [A/m]
     tau_lag: float = 4.0e-3    # magnetisation relaxation time        [s]
 
     # --- ball field-sampling model -----------------------------------------
-    ball_model: str = "point"  # "point" (original) or "volume" (distributed)
+    ball_model: str = "point"  # point, volume_independent, or volume_demag
     volume_quadrature: str = "medium"  # "coarse" (48), "medium" (192), "fine" (768)
+    demag_resolution: str = "medium"   # surface BEM resolution (static reference)
 
     # --- contact -----------------------------------------------------------
     mu_k: float = 0.15         # sliding friction coefficient
@@ -218,16 +228,23 @@ class FieldGrid:
         if cache_dir:
             os.makedirs(cache_dir, exist_ok=True)
             fn = os.path.join(cache_dir, f"field_{p.field_key()}.npz")
+        loaded = False
         if fn and os.path.exists(fn):
-            d = np.load(fn)
-            self.xs, self.ys, self.F = d["xs"], d["ys"], d["F"]
-        else:
+            try:
+                with np.load(fn) as d:
+                    self.xs, self.ys, self.F = d["xs"], d["ys"], d["F"]
+                loaded = True
+            except (OSError, ValueError, EOFError, zipfile.BadZipFile):
+                loaded = False
+        if not loaded:
             if verbose:
                 print(f"  [field] building grid (gap={p.gap*1e3:.1f} mm) ...",
                       flush=True)
             self.xs, self.ys, self.F = self._build()
             if fn:
-                np.savez_compressed(fn, xs=self.xs, ys=self.ys, F=self.F)
+                tmp = fn+f".tmp.{os.getpid()}.npz"
+                np.savez_compressed(tmp, xs=self.xs, ys=self.ys, F=self.F)
+                os.replace(tmp, fn)
         self.x0, self.y0 = self.xs[0], self.ys[0]
         self.dx = self.xs[1] - self.xs[0]
         self.dy = self.ys[1] - self.ys[0]
@@ -315,6 +332,13 @@ VOLUME_QUADRATURE_LEVELS = {
     "fine": (4, 6, 32),       # 768 elements
 }
 
+DEMAG_SURFACE_LEVELS = {
+    "coarse": (4, 8),       # 32 equal-longitude Gauss-latitude panels
+    "medium": (6, 12),     # 72 panels
+    "fine": (10, 24),      # 240 panels
+    "very_fine": (14, 32), # 448 panels
+}
+
 
 def sphere_quadrature(radius: float, level: str = "medium"):
     """Gauss-Legendre r/mu and uniform-azimuth quadrature for a sphere.
@@ -362,8 +386,8 @@ class VolumeFieldGrid:
 
     def __init__(self, p: Params, cache_dir: str | None = "volume_fieldcache",
                  verbose: bool = True):
-        if p.ball_model != "volume":
-            raise ValueError("VolumeFieldGrid requires Params(ball_model='volume')")
+        if p.ball_model not in ("volume", "volume_independent", "volume_demag"):
+            raise ValueError("VolumeFieldGrid requires a finite-volume ball_model")
         self.p = p
         self.points, self.weights = sphere_quadrature(p.ball_R, p.volume_quadrature)
         zvals, self.z_index = np.unique(self.points[:, 2], return_inverse=True)
@@ -375,10 +399,15 @@ class VolumeFieldGrid:
             os.makedirs(cache_dir, exist_ok=True)
             fn = os.path.join(cache_dir,
                               f"volume_field_{p.field_key()}_{p.volume_quadrature}_{qsig}.npz")
+        loaded = False
         if fn and os.path.exists(fn):
-            d = np.load(fn)
-            self.xs, self.ys, self.F = d["xs"], d["ys"], d["F"]
-        else:
+            try:
+                with np.load(fn) as d:
+                    self.xs, self.ys, self.F = d["xs"], d["ys"], d["F"]
+                loaded = True
+            except (OSError, ValueError, EOFError, zipfile.BadZipFile):
+                loaded = False
+        if not loaded:
             slices = []
             for iz, zoff in enumerate(zvals):
                 if verbose:
@@ -387,13 +416,17 @@ class VolumeFieldGrid:
                 # FieldGrid height is gap+ball_R; shifting gap shifts the entire
                 # sampling plane while preserving the original analytic model.
                 ps = replace(p, gap=p.gap + float(zoff), ball_model="point")
-                gs = FieldGrid(ps, cache_dir=None, verbose=False)
+                # Reuse ordinary plane caches: surface stacks can otherwise be
+                # expensive to rebuild, and every plane is exactly a FieldGrid.
+                gs = FieldGrid(ps, cache_dir="fieldcache", verbose=False)
                 if not slices:
                     self.xs, self.ys = gs.xs, gs.ys
                 slices.append(gs.F)
             self.F = np.stack(slices, axis=0)
             if fn:
-                np.savez_compressed(fn, xs=self.xs, ys=self.ys, F=self.F)
+                tmp = fn+f".tmp.{os.getpid()}.npz"
+                np.savez_compressed(tmp, xs=self.xs, ys=self.ys, F=self.F)
+                os.replace(tmp, fn)
         self.x0, self.y0 = self.xs[0], self.ys[0]
         self.dx = self.xs[1] - self.xs[0]
         self.dy = self.ys[1] - self.ys[0]
@@ -404,6 +437,239 @@ class VolumeFieldGrid:
 
     def volume_error(self):
         return abs(np.sum(self.weights) - self.p.volume) / self.p.volume
+
+    def sample(self, centre, angle=0.0):
+        centre = np.asarray(centre, dtype=float)
+        B = np.empty((self.n_elem, 3))
+        J = np.empty((self.n_elem, 3, 3))
+        for i, r in enumerate(self.points):
+            B[i], J[i] = _field_lab(self.F[self.z_index[i]], self.x0, self.y0,
+                                     self.dx, self.dy, centre[0]+r[0],
+                                     centre[1]+r[1], angle)
+        return B, J
+
+
+def sphere_surface_quadrature(radius: float, level: str = "medium"):
+    """Tensor-product surface quadrature with physical area weights."""
+    if level not in DEMAG_SURFACE_LEVELS:
+        raise ValueError(f"unknown demag resolution {level!r}; expected one of "
+                         f"{tuple(DEMAG_SURFACE_LEVELS)}")
+    nmu, nphi = DEMAG_SURFACE_LEVELS[level]
+    mu, wmu = np.polynomial.legendre.leggauss(nmu)
+    phi = 2.0*np.pi*np.arange(nphi)/nphi
+    points, weights = [], []
+    for u, wu in zip(mu, wmu):
+        st = np.sqrt(max(0.0, 1.0-u*u))
+        for ph in phi:
+            points.append((radius*st*np.cos(ph), radius*st*np.sin(ph), radius*u))
+            weights.append(radius*radius*wu*2.0*np.pi/nphi)
+    return np.asarray(points), np.asarray(weights)
+
+
+class PointSetFieldGrid:
+    """Stack existing FieldGrid planes for an arbitrary fixed point set."""
+
+    def __init__(self, p: Params, points, cache_dir: str | None = None,
+                 cache_tag: str = "points", verbose: bool = False):
+        self.p = p
+        self.points = np.asarray(points, dtype=float)
+        zvals, self.z_index = np.unique(self.points[:, 2], return_inverse=True)
+        qsig = hashlib.md5(self.points.tobytes()).hexdigest()[:12]
+        fn = None
+        if cache_dir:
+            os.makedirs(cache_dir, exist_ok=True)
+            fn = os.path.join(cache_dir,
+                              f"{cache_tag}_{p.field_key()}_{qsig}.npz")
+        loaded = False
+        if fn and os.path.exists(fn):
+            try:
+                with np.load(fn) as d:
+                    self.xs, self.ys, self.F = d["xs"], d["ys"], d["F"]
+                loaded = True
+            except (OSError, ValueError, EOFError, zipfile.BadZipFile):
+                loaded = False
+        if not loaded:
+            slices = []
+            for iz, zoff in enumerate(zvals):
+                if verbose:
+                    print(f"  [{cache_tag}] slice {iz+1}/{len(zvals)} "
+                          f"(z offset={zoff*1e3:+.3f} mm) ...", flush=True)
+                ps = replace(p, gap=p.gap+float(zoff), ball_model="point")
+                gs = FieldGrid(ps, cache_dir="fieldcache", verbose=False)
+                if not slices:
+                    self.xs, self.ys = gs.xs, gs.ys
+                slices.append(gs.F)
+            self.F = np.stack(slices)
+            if fn:
+                tmp = fn+f".tmp.{os.getpid()}.npz"
+                np.savez_compressed(tmp, xs=self.xs, ys=self.ys, F=self.F)
+                os.replace(tmp, fn)
+        self.x0, self.y0 = self.xs[0], self.ys[0]
+        self.dx, self.dy = self.xs[1]-self.xs[0], self.ys[1]-self.ys[0]
+
+    def sample(self, centre, angle=0.0):
+        """Return external B and J at all offsets in this point set."""
+        centre = np.asarray(centre, dtype=float)
+        B = np.empty((len(self.points), 3))
+        J = np.empty((len(self.points), 3, 3))
+        for i, r in enumerate(self.points):
+            B[i], J[i] = _field_lab(self.F[self.z_index[i]], self.x0, self.y0,
+                                     self.dx, self.dy, centre[0]+r[0],
+                                     centre[1]+r[1], angle)
+        return B, J
+
+
+class DemagSphereSolver:
+    """Linear boundary-element reference solver for a permeable sphere.
+
+    The unknown is surface magnetic charge sigma [A/m].  With outward normals
+    n_i, the interior normal demagnetizing field is (K sigma)_i-sigma_i/2.
+    Consequently
+
+      [(1+chi/2) I - chi K] sigma = chi n.H_ext.
+
+    Off-diagonal K entries use the Coulomb/dipole kernel and physical panel
+    areas.  The diagonal is the analytic solid-angle self panel: it is chosen
+    so every row sums to 1/2, the exact constant-mode eigenvalue of a sphere.
+    This is a principal-value self term, not a singular-distance cutoff.
+    Interior fields are reconstructed from spherical-harmonic coefficients of
+    sigma, avoiding near-surface point-panel errors.
+    """
+
+    def __init__(self, radius: float, mu_r: float, level: str = "medium"):
+        if not HAVE_SCIPY:
+            raise ImportError("volume_demag requires scipy")
+        if mu_r <= 1.0:
+            raise ValueError("mu_r must exceed 1 for this ferromagnetic reference")
+        self.radius, self.mu_r, self.chi, self.level = radius, mu_r, mu_r-1.0, level
+        self.surface_points, self.surface_weights = sphere_surface_quadrature(radius, level)
+        self.normals = self.surface_points/radius
+        n = len(self.surface_weights)
+        d = self.surface_points[:, None, :]-self.surface_points[None, :, :]
+        r = np.linalg.norm(d, axis=2)
+        mask = r > 0.0
+        K = np.zeros((n, n))
+        kernel = np.einsum("ik,ijk->ij", self.normals, d)
+        K[mask] = (kernel[mask]/(4.0*np.pi*r[mask]**3)
+                   * np.broadcast_to(self.surface_weights, r.shape)[mask])
+        np.fill_diagonal(K, 0.5-K.sum(axis=1))
+        self.K = K
+        self.A = (1.0+0.5*self.chi)*np.eye(n)-self.chi*K
+        self.lu = lu_factor(self.A)
+        self.lmax = DEMAG_SURFACE_LEVELS[level][0]-1
+
+    @property
+    def n_surface(self):
+        return len(self.surface_weights)
+
+    def solve_surface_charge(self, H_external_surface):
+        H_external_surface = np.asarray(H_external_surface)
+        rhs = self.chi*np.einsum("ij,ij->i", self.normals, H_external_surface)
+        return lu_solve(self.lu, rhs)
+
+    def total_moment(self, sigma):
+        """m = integral r sigma dS [A m^2]."""
+        return np.sum(self.surface_points*sigma[:, None]
+                      * self.surface_weights[:, None], axis=0)
+
+    def _charge_coefficients(self, sigma):
+        theta = np.arccos(np.clip(self.normals[:, 2], -1.0, 1.0))
+        phi = np.mod(np.arctan2(self.normals[:, 1], self.normals[:, 0]), 2*np.pi)
+        coeff = {}
+        dOmega = self.surface_weights/self.radius**2
+        for ell in range(self.lmax+1):
+            for m in range(-ell, ell+1):
+                Y = sph_harm_y(ell, m, theta, phi)
+                coeff[(ell, m)] = np.sum(sigma*np.conjugate(Y)*dOmega)
+        return coeff
+
+    def _potential(self, points, coeff):
+        points = np.asarray(points)
+        rr = np.linalg.norm(points, axis=1)
+        theta = np.zeros(len(points))
+        nz = rr > 0.0
+        theta[nz] = np.arccos(np.clip(points[nz, 2]/rr[nz], -1.0, 1.0))
+        phi = np.mod(np.arctan2(points[:, 1], points[:, 0]), 2*np.pi)
+        out = np.zeros(len(points), dtype=complex)
+        for (ell, m), c in coeff.items():
+            out += (self.radius*c/(2*ell+1)*(rr/self.radius)**ell
+                    * sph_harm_y(ell, m, theta, phi))
+        return out.real
+
+    def demag_field(self, sigma, points):
+        """Interior H_demag [A/m] from the solved global surface charge."""
+        points = np.asarray(points, dtype=float)
+        coeff = self._charge_coefficients(sigma)
+        eps = self.radius*2.0e-5
+        H = np.empty_like(points)
+        for axis in range(3):
+            dp = np.zeros(3); dp[axis] = eps
+            H[:, axis] = -(self._potential(points+dp, coeff)
+                           - self._potential(points-dp, coeff))/(2.0*eps)
+        return H
+
+    def solve(self, H_external_surface, H_external_volume, volume_points,
+              volume_weights):
+        sigma = self.solve_surface_charge(H_external_surface)
+        Hdemag = self.demag_field(sigma, volume_points)
+        M = self.chi*(np.asarray(H_external_volume)+Hdemag)
+        # Surface charge gives a more accurate integral moment than sampling M.
+        moment = self.total_moment(sigma)
+        return dict(sigma=sigma, Hdemag=Hdemag, M=M, moment=moment,
+                    sampled_moment=np.sum(M*np.asarray(volume_weights)[:, None], axis=0))
+
+
+def distributed_force_torque(M, B, J, points, weights):
+    """Integrate external-field force and both torque contributions."""
+    dm = np.asarray(M)*np.asarray(weights)[:, None]
+    dF = np.einsum("nij,nj->ni", np.asarray(J), dm)
+    force = np.sum(dF, axis=0)
+    torque = np.sum(np.cross(dm, B)+np.cross(points, dF), axis=0)
+    return force, torque
+
+
+def static_magnetic_response(p: Params, centre, angle=0.0, grid=None,
+                             surface_grid=None, demag_solver=None):
+    """Instantaneous equilibrium response used for finite-size validation.
+
+    ``volume_demag`` deliberately lives here rather than in ``simulate``:
+    this linear reference has no material history, lag, hysteresis, or skin
+    memory and must not be mixed with the existing dynamic closure.
+    """
+    centre = np.asarray(centre, dtype=float)
+    model = "volume_independent" if p.ball_model == "volume" else p.ball_model
+    if model == "point":
+        if grid is None:
+            grid = FieldGrid(p, verbose=False)
+        B, J = _field_lab(grid.F, grid.x0, grid.y0, grid.dx, grid.dy,
+                          centre[0], centre[1], angle)
+        bn = np.linalg.norm(B)
+        m = p.alpha*B
+        if np.linalg.norm(m) > p.m_sat:
+            m = p.m_sat*B/(bn+1e-300)
+        return dict(moment=m, force=J@m, torque=np.cross(m, B), B=B)
+    if grid is None:
+        grid = VolumeFieldGrid(p, verbose=False)
+    B, J = grid.sample(centre, angle)
+    if model == "volume_independent":
+        bn = np.linalg.norm(B, axis=1)
+        mag = np.minimum(3.0*bn/MU0, p.Ms)
+        M = mag[:, None]*B/np.maximum(bn[:, None], 1e-300)
+        force, torque = distributed_force_torque(M, B, J, grid.points, grid.weights)
+        return dict(moment=np.sum(M*grid.weights[:, None], axis=0), force=force,
+                    torque=torque, B=B, M=M)
+    if model != "volume_demag":
+        raise ValueError(f"unknown ball_model {p.ball_model!r}")
+    solver = demag_solver or DemagSphereSolver(p.ball_R, p.mu_r,
+                                                p.demag_resolution)
+    if surface_grid is None:
+        surface_grid = PointSetFieldGrid(p, solver.surface_points, verbose=False)
+    Bs, _ = surface_grid.sample(centre, angle)
+    sol = solver.solve(Bs/MU0, B/MU0, grid.points, grid.weights)
+    force, torque = distributed_force_torque(sol["M"], B, J,
+                                              grid.points, grid.weights)
+    sol.update(force=force, torque=torque, B=B, B_surface=Bs)
+    return sol
 
 
 # ============================================================================
@@ -809,15 +1075,19 @@ def simulate(p: Params, t_end=1.2, dt=2.0e-5, stride=25,
     seamlessly from the final state of a previous one -- needed for ramp
     experiments, otherwise every step restarts with zero spin and zero
     magnetisation and the transient swamps the result."""
-    if p.ball_model not in ("point", "volume"):
-        raise ValueError("ball_model must be 'point' or 'volume'")
+    if p.ball_model == "volume_demag":
+        raise ValueError("volume_demag is an instantaneous static reference; "
+                         "use static_magnetic_response, not the lag-state RK4 simulator")
+    if p.ball_model not in ("point", "volume", "volume_independent"):
+        raise ValueError("ball_model must be 'point', 'volume_independent', or "
+                         "'volume_demag' ('volume' is a legacy alias)")
     if grid is None:
         g = (FieldGrid(p, verbose=verbose) if p.ball_model == "point"
              else VolumeFieldGrid(p, verbose=verbose))
     else:
         g = grid
-    if p.ball_model == "volume" and not isinstance(g, VolumeFieldGrid):
-        raise TypeError("ball_model='volume' requires a VolumeFieldGrid")
+    if p.ball_model in ("volume", "volume_independent") and not isinstance(g, VolumeFieldGrid):
+        raise TypeError("finite-volume dynamics require a VolumeFieldGrid")
     if p.ball_model == "point" and not isinstance(g, FieldGrid):
         raise TypeError("ball_model='point' requires a FieldGrid")
     if y_init is not None:

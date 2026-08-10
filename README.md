@@ -77,25 +77,34 @@ synchronously with the field — i.e. genuine induction/hysteresis-motor physics
 not a hand-inserted drag term. `τ_lag` lumps eddy currents and hysteresis into
 one measurable parameter.
 
-Two ball field-sampling models are available:
+Three ball response models are available:
 
 * `ball_model="point"` is the original and still-default model. The entire
   sphere is represented by one relaxing dipole sampled at its centre.
-* `ball_model="volume"` is a first-order finite-size model. Deterministic
+* `ball_model="volume_independent"` is the original diagnostic finite-size
+  model (`"volume"` remains a legacy alias). Deterministic
   spherical quadrature samples the applied field and gradient throughout the
   ball, evolves one local magnetisation-density state per volume element, and
-sums both dipole torque `dm × B` and distributed-force torque `r × dF`.
-Because the ball and quadrature domain are isotropic, the integration points are
-kept lab-aligned (`R_body=I`) rather than adding an otherwise unobservable body
-orientation state. Local vector magnetisation still contains the existing
-`ω_ball × M` rotation term.
+  sums both dipole torque `dm × B` and distributed-force torque `r × dF`. It
+  applies the point model's effective whole-sphere `3H` response locally and is
+  retained for diagnosis, not as a self-consistent material law. Its persistent
+  `M_i` histories are attached to lab-aligned quadrature cells while also using
+  `omega_ball × M_i`; that combination is not a consistent material-point model.
+* `ball_model="volume_demag"` is an instantaneous linear-reference model with
+  intrinsic `mu_r`. A sphere boundary-element solve determines the global
+  surface magnetic charge and hence the self-consistent internal demagnetizing
+  field before applying `M=chi H_int`. It has no lag or material history and is
+  exposed through `static_magnetic_response`; the dynamic RK4 driver rejects
+  it deliberately.
 
-The volume model accounts for nonuniform **applied** field across the sphere,
-but it is not a complete Maxwell or ferromagnetic-sphere solution. It neglects
-internal demagnetising-field coupling between elements, eddy-current/skin-depth
-shielding, true hysteresis/remanence, and interaction with a conductive plate.
+The demagnetizing model uses a linear, constant permeability. Real steel has a
+field-dependent permeability, so the default `mu_r=100` is a documented
+reference value rather than a material measurement. It still neglects
+eddy-current/skin-depth shielding, true hysteresis/remanence, nonlinear
+saturation feedback, and interaction with a conductive plate.
 The default quadrature is `volume_quadrature="medium"` (192 elements); `coarse`
-(48) and `fine` (768) are available for convergence checks.
+(48) and `fine` (768) are available for convergence checks. The separate
+`demag_resolution` selects the surface discretization.
 
 ### Contact
 
