@@ -106,6 +106,47 @@ The default quadrature is `volume_quadrature="medium"` (192 elements); `coarse`
 (48) and `fine` (768) are available for convergence checks. The separate
 `demag_resolution` selects the surface discretization.
 
+Electrical conductivity `sigma` and AC permeability `mu_r_ac` are diagnostic
+metadata for the Step 5A skin-depth study; they do not alter any force, torque,
+or integration path. Their defaults (`6e6 S/m` and `100`) are labelled
+reference assumptions, not measured properties of the ball. The standalone
+`diagnose_skin_effect.py` reconstructs a body-to-lab quaternion from the
+point-model trajectory and analyzes the full external-field vector in the
+material frame. No skin correction is currently applied to the simulation.
+
+`magnetic_diffusion_sphere.py` is the isolated Step 5B-1 physics kernel for a
+homogeneous conducting permeable sphere. It uses the `exp(+i omega t)` phasor
+convention, `kappa=(1+i)/delta`, and decoupled spherical-Bessel modes. The
+module is independently tested against the exact magnetostatic multipole
+limits, conductivity and frequency limits, passivity, and numerical continuity.
+It also provides stable two-pole reduced models for later study. These AC
+responses are not yet connected to the Carousel RK4 dynamics.
+
+## Model development status
+
+* **M0 — point model.** The original point-dipole sphere with the
+  phenomenological `tau_lag` relaxation law remains the production model.
+* **M1 — independent finite-volume diagnostic.** Retained for comparison only:
+  applying the effective whole-sphere `3H` law independently at every volume
+  point is not a physically self-consistent constitutive model.
+* **M2 — self-consistent finite-size magnetostatics.** A linear permeable sphere
+  with internal demagnetization, validated against the analytic response of a
+  sphere in a uniform field.
+* **M3 — magnetic diffusion / skin effect.** The exact spherical AC diffusion
+  kernel and an independent external Maxwell-stress force/torque evaluator are
+  validated diagnostic/reference modules. Across the Carousel snapshots,
+  diffusion changed trapping/radial force by at most about **0.0157%**, vertical
+  force by **0.0166%**, and the offline multi-frequency force estimate by
+  **0.0199%**. In an ideal rotating uniform field its torque was only
+  **2.03--2.43%** of the torque produced by the existing `tau_lag=4 ms` law.
+
+Consequently, a production diffusion-state model is not currently justified.
+The production RK4 remains unchanged, and `tau_lag` must not be interpreted as
+homogeneous-sphere eddy-current diffusion. The largest unresolved magnetic
+uncertainty is now the ball's measured nonlinear B-H and hysteretic response.
+`magnetic_diffusion_sphere.py` and `magnetic_diffusion_wrench.py` remain
+validated offline physics references for that conclusion.
+
 ### Contact
 
 Regularised Coulomb friction (`tanh(|u|/u_reg)`) at the contact point plus

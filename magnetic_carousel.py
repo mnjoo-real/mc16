@@ -107,6 +107,8 @@ class Params:
     mu_r: float = 100.0        # intrinsic relative permeability (linear reference)
     Ms: float = 1.7e6          # saturation magnetisation             [A/m]
     tau_lag: float = 4.0e-3    # magnetisation relaxation time        [s]
+    sigma: float = 6.0e6       # diagnostic electrical conductivity only [S/m]
+    mu_r_ac: float = 100.0     # diagnostic AC relative permeability only
 
     # --- ball field-sampling model -----------------------------------------
     ball_model: str = "point"  # point, volume_independent, or volume_demag
