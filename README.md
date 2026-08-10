@@ -147,6 +147,32 @@ uncertainty is now the ball's measured nonlinear B-H and hysteretic response.
 `magnetic_diffusion_sphere.py` and `magnetic_diffusion_wrench.py` remain
 validated offline physics references for that conclusion.
 
+### Step 6A — hysteresis-scale diagnostic
+
+Step 5 showed that homogeneous-sphere eddy currents are far too weak to be the
+primary meaning of `tau_lag`. Step 6 therefore turns to the measured B-H and
+hysteretic response of the ball. The standalone `hysteresis_scale.py` and
+`diagnose_hysteresis_scale.py` isolate the present relaxation law in prescribed
+linear and circular fields, derive its M-H loop work and dissipation, and
+compare representative Carousel trajectories with the exact Step-5 diffusion
+loss. They do not alter the production force, contact, or RK4 laws.
+
+The current lag closure has no true remanent state, nonzero quasistatic
+coercivity, or rate-independent closed loop. Its finite-frequency M-H ellipse
+is purely dynamic: loop area, apparent coercive intercept, and apparent
+remanent intercept all vanish linearly as frequency tends to zero. For the four
+representative Carousel trajectories, the lag law requires approximately
+29--3216 J/m3 per dominant material-frame cycle, about 36--47 times the exact
+homogeneous-sphere l=1 eddy-current loss summed over the measured spectrum.
+
+No production hysteresis model has been selected or implemented. Quantitative
+calibration still requires the ball's saturation magnetization, initial and
+reversible permeability, major-loop coercivity and remanence, full major-loop
+shape, and preferably minor and rotational loops over the Carousel field
+range. A scalar Jiles--Atherton curve can be useful as a one-dimensional
+material-characterization kernel, but it is not a sufficient final law for the
+Carousel's rotating vector field.
+
 ### Contact
 
 Regularised Coulomb friction (`tanh(|u|/u_reg)`) at the contact point plus
